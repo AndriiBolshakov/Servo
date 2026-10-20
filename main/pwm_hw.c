@@ -1,49 +1,77 @@
 #include "pwm_hw.h"
-#include "driver/ledc.h"
-#include "esp_log.h"
 
-#define LEDC_TIMER              LEDC_TIMER_0
-#define LEDC_MODE               LEDC_LOW_SPEED_MODE
-#define LEDC_OUTPUT_IO          (5) // GPIO 5
-#define LEDC_CHANNEL            LEDC_CHANNEL_0
-#define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // 13-bit resolution (8192 steps)
-#define LEDC_FREQUENCY          (50)              // 50Hz (20ms period for SG90)
+#include "driver/gpio.h"
+#include "esp_rom_gpio.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/ledc_struct.h"
+#include "soc/system_struct.h"
+
+#define PWM_RES_BITS      13
+#define PWM_PERIOD_TICKS  (1u << PWM_RES_BITS)
+#define PWM_HZ            50
+#define APB_HZ            80000000u
+#define PERIOD_US         20000u
+
+#define CLK_DIV ((uint32_t)(((uint64_t)APB_HZ << 8) / (PWM_HZ * PWM_PERIOD_TICKS)))
+
+#define TMR   LEDC.timer_group[0].timer[0]
+#define CH    LEDC.channel_group[0].channel[0]
+
+static void pwm_hw_enable_clock(void)
+{
+    SYSTEM.perip_clk_en0.ledc_clk_en = 1;
+    SYSTEM.perip_rst_en0.ledc_rst = 1;
+    SYSTEM.perip_rst_en0.ledc_rst = 0;
+
+    LEDC.conf.apb_clk_sel = 1;   // APB 80 MHz
+    LEDC.conf.clk_en = 1;
+}
 
 void pwm_hw_init(int gpio)
 {
-    // 1. Configure the LEDC timer
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode       = LEDC_MODE,
-        .timer_num        = LEDC_TIMER,
-        .duty_resolution  = LEDC_DUTY_RES,
-        .freq_hz          = LEDC_FREQUENCY,
-        .clk_cfg          = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+    pwm_hw_enable_clock();
 
-    // 2. Configure the LEDC channel
-    ledc_channel_config_t ledc_channel = {
-        .speed_mode     = LEDC_MODE,
-        .channel        = LEDC_CHANNEL,
-        .timer_sel      = LEDC_TIMER,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = gpio,
-        .duty           = 0, // Set initial duty to 0
-        .hpoint         = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    /* ---- timer ---- */
+    TMR.conf.rst = 1;                         // hold in reset while configuring
+    TMR.conf.pause = 0;
+    TMR.conf.duty_resolution = PWM_RES_BITS;
+    TMR.conf.clock_divider = CLK_DIV;
+    TMR.conf.low_speed_update = 1;                     // latch divider + resolution
+    TMR.conf.rst = 0;                         // release reset -> counter runs
+
+    /* ---- channel ---- */
+    CH.conf0.timer_sel = 0;
+    CH.conf0.idle_lv = 0;
+    CH.hpoint.hpoint = 0;
+    CH.duty.duty = 0;
+    CH.conf1.duty_scale = 0;
+    CH.conf1.duty_cycle = 1;
+    CH.conf1.duty_num = 1;
+    CH.conf1.duty_inc = 1;
+    CH.conf0.sig_out_en = 1;
+    CH.conf1.duty_start = 1;
+    CH.conf0.low_speed_update = 1;                     // latch channel config
+
+    /* ---- GPIO matrix ---- */
+    gpio_reset_pin(gpio);
+    gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+    esp_rom_gpio_connect_out_signal(gpio, LEDC_LS_SIG_OUT0_IDX, false, false);
 }
 
 void pwm_hw_set_pulse_us(uint32_t pulse_us)
 {
-    // SG90 safe pulse bounds roughly 500us (0°) to 2400us (180°)
-    if (pulse_us > 20000) {
-        pulse_us = 20000;
-    }
+    if (pulse_us > PERIOD_US) pulse_us = PERIOD_US;
 
-    // Convert microsecond pulse width to 13-bit duty value (8192 steps per 20000us period)
-    uint32_t duty = (pulse_us * 8192) / 20000;
+    const uint32_t duty = (pulse_us * PWM_PERIOD_TICKS) / PERIOD_US;
 
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    CH.hpoint.hpoint = 0;
+    CH.duty.duty = duty << 4;                 // 4 fractional bits
+    CH.conf1.duty_scale = 0;
+    CH.conf1.duty_cycle = 1;
+    CH.conf1.duty_num = 1;
+    CH.conf1.duty_inc = 1;
+
+    CH.conf0.sig_out_en = 1;
+    CH.conf1.duty_start = 1;
+    CH.conf0.low_speed_update = 1;                     // must come last
 }
